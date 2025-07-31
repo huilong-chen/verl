@@ -1,213 +1,302 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-# Copyright 2023-2024 SGLang Team
-# Copyright 2025 ModelBest Inc. and/or its affiliates
+# 版权所有 2024 Bytedance Ltd. 和/或其附属公司
+# 版权所有 2023-2024 SGLang Team
+# 版权所有 2025 ModelBest Inc. 和/或其附属公司
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# 根据 Apache 许可证 2.0 版本（"许可证"）授权；
+# 除非遵守许可证，否则您不得使用此文件。
+# 您可以在以下位置获取许可证副本：
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# 除非适用法律要求或书面同意，否则根据许可证分发的软件
+# 按"原样"分发，不附带任何明示或暗示的保证或条件。
+# 请参阅许可证以了解有关权限和限制的具体语言。
 """
-PPO Trainer with Ray-based single controller.
-This trainer supports model-agonistic model initialization with huggingface
+基于 Ray 单控制器的 PPO 训练器。
+此训练器支持使用 huggingface 进行模型不可知的模型初始化
 """
 
+# 导入 JSON 处理库，用于数据的序列化和反序列化
 import json
+# 导入操作系统接口模块，用于文件和目录操作
 import os
+# 导入 UUID 生成库，用于生成唯一标识符
 import uuid
+# 导入警告模块，用于控制警告信息的显示
 import warnings
+# 导入默认字典类，用于创建具有默认值的字典
 from collections import defaultdict
+# 导入深拷贝函数，用于创建对象的完整副本
 from copy import deepcopy
+# 导入数据类装饰器和字段函数，用于简化类的定义
 from dataclasses import dataclass, field
+# 导入枚举类，用于创建枚举类型
 from enum import Enum
+# 导入美化打印函数，用于格式化输出复杂数据结构
 from pprint import pprint
+# 导入可选类型注解，用于类型提示
 from typing import Optional
 
+# 导入 NumPy 数值计算库，用于高效的数组操作
 import numpy as np
+# 导入 Ray 分布式计算框架，用于构建分布式应用
 import ray
+# 导入 PyTorch 深度学习框架，用于张量计算和神经网络
 import torch
+# 导入 OmegaConf 配置管理库，用于处理配置文件
 from omegaconf import OmegaConf, open_dict
+# 导入 PyTorch 数据集和数据采样器
 from torch.utils.data import Dataset, Sampler
+# 导入状态化数据加载器，用于保持数据加载状态
 from torchdata.stateful_dataloader import StatefulDataLoader
+# 导入进度条库，用于显示训练进度
 from tqdm import tqdm
 
+# 导入 VERL 框架的核心数据协议
 from verl import DataProto
+# 导入实验性的课程学习采样器
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+# 导入数据协议的填充和取消填充工具函数
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+# 导入基础工作器类
 from verl.single_controller.base import Worker
+# 导入 Ray 相关的类和资源池
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+# 导入 Ray 基础模块中的工作器创建函数
 from verl.single_controller.ray.base import create_colocated_worker_cls
+# 导入算法配置类
 from verl.trainer.config import AlgoConfig
+# 导入 PPO 核心算法模块
 from verl.trainer.ppo import core_algos
+# 导入优势估计器和损失聚合函数
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+# 导入指标计算工具函数
 from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
-    compute_throughout_metrics,
-    compute_timing_metrics,
-    process_validation_metrics,
+    compute_data_metrics,          # 计算数据相关指标
+    compute_throughout_metrics,    # 计算吞吐量指标
+    compute_timing_metrics,        # 计算时间相关指标
+    process_validation_metrics,    # 处理验证指标
 )
+# 导入奖励计算函数（同步和异步）
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+# 导入检查点管理工具函数
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+# 导入配置转换工具函数
 from verl.utils.config import omega_conf_to_dataclass
+# 导入调试计时器工具
 from verl.utils.debug import marked_timer
+# 导入指标聚合工具函数
 from verl.utils.metric import reduce_metrics
+# 导入序列长度平衡工具函数
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+# 导入 PyTorch 函数式工具中的掩码均值计算
 from verl.utils.torch_functional import masked_mean
+# 导入验证生成日志记录器
 from verl.utils.tracking import ValidationGenerationsLogger
 
+# 定义工作器类型为工作器类的类型别名
 WorkerType = type[Worker]
 
 
 class Role(Enum):
     """
-    To create more roles dynamically, you can subclass Role and add new members
+    训练系统中不同角色的枚举定义。
+    
+    要动态创建更多角色，您可以继承 Role 并添加新成员。
+    每个角色代表训练过程中的一个特定功能组件。
     """
 
+    # Actor 角色：负责策略网络的前向传播和参数更新
     Actor = 0
+    # Rollout 角色：负责生成经验轨迹和环境交互
     Rollout = 1
+    # ActorRollout 角色：结合 Actor 和 Rollout 功能的混合角色
     ActorRollout = 2
+    # Critic 角色：负责价值函数的估计和更新
     Critic = 3
+    # RefPolicy 角色：参考策略，用于 KL 散度计算和策略约束
     RefPolicy = 4
+    # RewardModel 角色：奖励模型，用于评估动作的质量
     RewardModel = 5
+    # ActorRolloutRef 角色：结合 Actor、Rollout 和 Ref 功能的混合角色
     ActorRolloutRef = 6
 
 
 @dataclass
 class ResourcePoolManager:
     """
-    Define a resource pool specification. Resource pool will be initialized first.
+    资源池管理器：定义和管理分布式训练中的资源池规范。
+    
+    资源池将在其他组件之前首先初始化，确保资源分配的合理性。
+    负责检查资源可用性并创建相应的 Ray 资源池。
     """
 
+    # 资源池规范字典：键为资源池名称，值为每个节点上的进程数量列表
     resource_pool_spec: dict[str, list[int]]
+    # 角色到资源池名称的映射字典
     mapping: dict[Role, str]
+    # 资源池字典：存储已创建的 Ray 资源池实例
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
 
     def create_resource_pool(self):
-        """Create Ray resource pools for distributed training.
+        """为分布式训练创建 Ray 资源池。
 
-        Initializes resource pools based on the resource pool specification,
-        with each pool managing GPU resources across multiple nodes.
-        For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
-        For Megatron backend, uses max_colocate_count>1 for different models.
+        根据资源池规范初始化资源池，每个池管理跨多个节点的 GPU 资源。
+        对于 FSDP 后端，使用 max_colocate_count=1 来合并 WorkerGroups。
+        对于 Megatron 后端，使用 max_colocate_count>1 来支持不同模型。
         """
+        # 遍历资源池规范中的每个资源池配置
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
-            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
-            # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
-            # For Megatron backend, we recommend using max_colocate_count>1
-            # that can utilize different WorkerGroup for differnt models
+            # max_colocate_count 表示每个 RayResourcePool 中的 WorkerGroups（即进程）数量
+            # 对于 FSDP 后端，建议使用 max_colocate_count=1 将所有 WorkerGroups 合并为一个
+            # 对于 Megatron 后端，建议使用 max_colocate_count>1
+            # 这样可以为不同模型利用不同的 WorkerGroup
             resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=1, name_prefix=resource_pool_name
+                process_on_nodes=process_on_nodes,    # 每个节点上的进程数量
+                use_gpu=True,                       # 启用 GPU 使用
+                max_colocate_count=1,              # 最大共定位计数
+                name_prefix=resource_pool_name     # 资源池名称前缀
             )
+            # 将创建的资源池存储到字典中
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
+        # 检查资源是否可用
         self._check_resource_available()
 
     def get_resource_pool(self, role: Role) -> RayResourcePool:
-        """Get the resource pool of the worker_cls"""
+        """获取指定角色对应的资源池。
+        
+        Args:
+            role (Role): 要获取资源池的角色类型
+            
+        Returns:
+            RayResourcePool: 对应角色的 Ray 资源池实例
+        """
         return self.resource_pool_dict[self.mapping[role]]
 
     def get_n_gpus(self) -> int:
-        """Get the number of gpus in this cluster."""
+        """获取集群中 GPU 的总数。
+        
+        Returns:
+            int: 集群中可用的 GPU 总数
+        """
+        # 计算所有资源池中 GPU 数量的总和
         return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
 
     def _check_resource_available(self):
-        """Check if the resource pool can be satisfied in this ray cluster."""
+        """检查 Ray 集群中的资源是否满足资源池的需求。
+        
+        该方法验证集群是否有足够的 GPU/NPU 资源来满足所有资源池的要求。
+        如果资源不足，将抛出 ValueError 异常。
+        """
+        # 获取每个节点的可用资源信息
         node_available_resources = ray.state.available_resources_per_node()
+        # 提取每个节点的可用 GPU/NPU 数量
         node_available_gpus = {
             node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
             for node, node_info in node_available_resources.items()
         }
 
-        # check total required gpus can be satisfied
+        # 检查所需的总 GPU 数量是否可以得到满足
         total_available_gpus = sum(node_available_gpus.values())
         total_required_gpus = sum(
             [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
         )
         if total_available_gpus < total_required_gpus:
             raise ValueError(
-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
+                f"可用的 GPU 总数 {total_available_gpus} 小于所需的 GPU 总数 {total_required_gpus}"
             )
 
-        # check each resource pool can be satisfied, O(#resource_pools * #nodes)
+        # 检查每个资源池是否可以得到满足，时间复杂度为 O(#resource_pools * #nodes)
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
             num_gpus, num_nodes = process_on_nodes[0], len(process_on_nodes)
+            # 遍历每个节点，尝试分配所需的 GPU 资源
             for node, available_gpus in node_available_gpus.items():
                 if available_gpus >= num_gpus:
+                    # 从该节点分配所需的 GPU 数量
                     node_available_gpus[node] -= num_gpus
                     num_nodes -= 1
                     if num_nodes == 0:
                         break
+            # 如果还有未满足的节点需求，抛出异常
             if num_nodes > 0:
                 raise ValueError(
-                    f"Resource pool {resource_pool_name}: {num_gpus}*{num_nodes}"
-                    + "cannot be satisfied in this ray cluster"
+                    f"资源池 {resource_pool_name}: {num_gpus}*{num_nodes} "
+                    + "无法在此 Ray 集群中得到满足"
                 )
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
-    """Apply KL penalty to the token-level rewards.
+    """对 token 级别的奖励应用 KL 散度惩罚。
 
-    This function computes the KL divergence between the reference policy and current policy,
-    then applies a penalty to the token-level rewards based on this divergence.
+    该函数计算参考策略和当前策略之间的 KL 散度，
+    然后基于这个散度对 token 级别的奖励应用惩罚。
 
     Args:
-        data (DataProto): The data containing batched model outputs and inputs.
-        kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
-        kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
-        multi_turn (bool, optional): Whether the data is from a multi-turn conversation. Defaults to False.
+        data (DataProto): 包含批处理模型输出和输入的数据。
+        kl_ctrl (core_algos.AdaptiveKLController): 自适应 KL 惩罚控制器。
+        kl_penalty (str, optional): 要应用的 KL 惩罚类型。默认为 "kl"。
 
     Returns:
-        tuple: A tuple containing:
-            - The updated data with token-level rewards adjusted by KL penalty
-            - A dictionary of metrics related to the KL penalty
+        tuple: 包含以下内容的元组：
+            - 更新后的数据，其中 token 级别奖励已根据 KL 惩罚进行调整
+            - 与 KL 惩罚相关的指标字典
     """
+    # 获取响应掩码，用于标识哪些位置是响应部分
     response_mask = data.batch["response_mask"]
+    # 获取 token 级别的分数（原始奖励）
     token_level_scores = data.batch["token_level_scores"]
+    # 获取批次大小
     batch_size = data.batch.batch_size[0]
 
-    # compute kl between ref_policy and current policy
-    # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
+    # 计算参考策略和当前策略之间的 KL 散度
+    # 当应用 KL 惩罚时，algorithm.use_kl_in_reward=True，所以参考模型已被启用
     kld = core_algos.kl_penalty(
         data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
-    )  # (batch_size, response_length)
+    )  # 输出形状: (batch_size, response_length)
+    # 将 KL 散度乘以响应掩码，只对响应部分应用惩罚
     kld = kld * response_mask
+    # 获取当前的 KL 惩罚系数
     beta = kl_ctrl.value
 
+    # 计算 token 级别的最终奖励：原始奖励减去 KL 惩罚
     token_level_rewards = token_level_scores - beta * kld
 
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
-    current_kl = torch.mean(current_kl, dim=0).item()
+    # 计算当前的平均 KL 散度（在序列维度上平均）
+    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # 在序列上求平均
+    current_kl = torch.mean(current_kl, dim=0).item()  # 在批次上求平均并转换为标量
 
-    # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
+    # 参考：https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
+    # 更新 KL 控制器
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+    # 将计算得到的 token 级别奖励保存回数据中
     data.batch["token_level_rewards"] = token_level_rewards
 
+    # 构建与 KL 惩罚相关的指标字典
     metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
 
     return data, metrics
 
 
 def compute_response_mask(data: DataProto):
-    """Compute the attention mask for the response part of the sequence.
+    """计算序列中响应部分的注意力掩码。
 
-    This function extracts the portion of the attention mask that corresponds to the model's response,
-    which is used for masking computations that should only apply to response tokens.
+    该函数提取与模型响应相对应的注意力掩码部分，
+    该掩码用于屏蔽只应应用于响应 token 的计算。
 
     Args:
-        data (DataProto): The data containing batched model outputs and inputs.
+        data (DataProto): 包含批处理模型输出和输入的数据。
 
     Returns:
-        torch.Tensor: The attention mask for the response tokens.
+        torch.Tensor: 响应 token 的注意力掩码。
     """
+    # 获取响应序列
     responses = data.batch["responses"]
+    # 获取响应序列的长度
     response_length = responses.size(1)
+    # 获取完整的注意力掩码
     attention_mask = data.batch["attention_mask"]
+    # 返回注意力掩码的最后 response_length 列，即响应部分的掩码
     return attention_mask[:, -response_length:]
 
 
@@ -220,197 +309,236 @@ def compute_advantage(
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
 ) -> DataProto:
-    """Compute advantage estimates for policy optimization.
+    """计算用于策略优化的优势估计。
 
-    This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
-    The advantage estimates are used to guide policy optimization in RL algorithms.
+    该函数使用各种估计器（如 GAE、GRPO、REINFORCE++ 等）计算优势估计。
+    优势估计用于指导强化学习算法中的策略优化。
 
     Args:
-        data (DataProto): The data containing batched model outputs and inputs.
-        adv_estimator (AdvantageEstimator): The advantage estimator to use (e.g., GAE, GRPO, REINFORCE++).
-        gamma (float, optional): Discount factor for future rewards. Defaults to 1.0.
-        lam (float, optional): Lambda parameter for GAE. Defaults to 1.0.
-        num_repeat (int, optional): Number of times to repeat the computation. Defaults to 1.
-        norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in
-            GRPO. Defaults to True.
-        config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
+        data (DataProto): 包含批处理模型输出和输入的数据。
+        adv_estimator (AdvantageEstimator): 要使用的优势估计器（例如：GAE、GRPO、REINFORCE++）。
+        gamma (float, optional): 未来奖励的折扣因子。默认为 1.0。
+        lam (float, optional): GAE 的 Lambda 参数。默认为 1.0。
+        num_repeat (int, optional): 重复计算的次数。默认为 1。
+        norm_adv_by_std_in_grpo (bool, optional): 是否在 GRPO 中按标准差归一化优势。
+            默认为 True。
+        config (dict, optional): 算法设置的配置字典。默认为 None。
 
     Returns:
-        DataProto: The updated data with computed advantages and returns.
+        DataProto: 更新后的数据，包含计算得到的优势和回报。
     """
-    # Back-compatible with trainers that do not compute response mask in fit
+    # 与不在 fit 中计算响应掩码的训练器向后兼容
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
-    # prepare response group
+    
+    # 根据不同的优势估计器类型进行计算
     if adv_estimator == AdvantageEstimator.GAE:
-        # Compute advantages and returns using Generalized Advantage Estimation (GAE)
+        # 使用广义优势估计（GAE）计算优势和回报
         advantages, returns = core_algos.compute_gae_advantage_return(
-            token_level_rewards=data.batch["token_level_rewards"],
-            values=data.batch["values"],
-            response_mask=data.batch["response_mask"],
-            gamma=gamma,
-            lam=lam,
+            token_level_rewards=data.batch["token_level_rewards"],  # token 级别奖励
+            values=data.batch["values"],                         # 价值函数估计
+            response_mask=data.batch["response_mask"],           # 响应掩码
+            gamma=gamma,                                           # 折扣因子
+            lam=lam,                                               # GAE lambda 参数
         )
+        # 将计算得到的优势和回报保存到数据中
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        # 如果使用 PF-PPO，进行数据重新加权
         if config.get("use_pf_ppo", False):
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
-                config.pf_ppo.get("reweight_method"),
-                config.pf_ppo.get("weight_pow"),
+                config.pf_ppo.get("reweight_method"),    # 重新加权方法
+                config.pf_ppo.get("weight_pow"),          # 权重幂次
             )
     elif adv_estimator == AdvantageEstimator.GRPO:
-        # Initialize the mask for GRPO calculation
+        # 初始化 GRPO 计算的掩码
         grpo_calculation_mask = data.batch["response_mask"]
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
+        # 调用 GRPO 结果优势计算函数，参数匹配其定义
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            token_level_rewards=data.batch["token_level_rewards"],  # token 级别奖励
+            response_mask=grpo_calculation_mask,                    # GRPO 计算掩码
+            index=data.non_tensor_batch["uid"],                    # 样本索引
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,        # 是否按标准差归一化
         )
+        # 将计算得到的优势和回报保存到数据中
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     else:
-        # handle all other adv estimator type other than GAE and GRPO
+        # 处理除 GAE 和 GRPO 之外的所有其他优势估计器类型
+        # 获取对应的优势估计器函数
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
+        # 构建优势估计器的参数字典
         adv_kwargs = {
             "token_level_rewards": data.batch["token_level_rewards"],
             "response_mask": data.batch["response_mask"],
             "config": config,
         }
-        if "uid" in data.non_tensor_batch:  # optional
+        # 可选参数：如果有 uid，添加到参数中
+        if "uid" in data.non_tensor_batch:
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
-        if "reward_baselines" in data.batch:  # optional
+        # 可选参数：如果有奖励基线，添加到参数中
+        if "reward_baselines" in data.batch:
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
 
-        # calculate advantage estimator
+        # 计算优势估计器
         advantages, returns = adv_estimator_fn(**adv_kwargs)
+        # 将计算得到的优势和回报保存到数据中
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    
     return data
 
 
 class RayPPOTrainer:
-    """Distributed PPO trainer using Ray for scalable reinforcement learning.
+    """使用 Ray 进行可扩展强化学习的分布式 PPO 训练器。
 
-    This trainer orchestrates distributed PPO training across multiple nodes and GPUs,
-    managing actor rollouts, critic training, and reward computation with Ray backend.
-    Supports various model architectures including FSDP, Megatron, and vLLM integration.
+    该训练器在多个节点和 GPU 上协调分布式 PPO 训练，
+    使用 Ray 后端管理 actor rollouts、critic 训练和奖励计算。
+    支持多种模型架构，包括 FSDP、Megatron 和 vLLM 集成。
     """
 
-    # TODO: support each role have individual ray_worker_group_cls,
-    # i.e., support different backend of different role
+    # TODO: 支持每个角色有独立的 ray_worker_group_cls，
+    # 即支持不同角色的不同后端
     def __init__(
         self,
-        config,
-        tokenizer,
-        role_worker_mapping: dict[Role, WorkerType],
-        resource_pool_manager: ResourcePoolManager,
-        ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
-        processor=None,
-        reward_fn=None,
-        val_reward_fn=None,
-        train_dataset: Optional[Dataset] = None,
-        val_dataset: Optional[Dataset] = None,
-        collate_fn=None,
-        train_sampler: Optional[Sampler] = None,
-        device_name=None,
+        config,                                        # 训练配置对象
+        tokenizer,                                    # 分词器，用于文本编码和解码
+        role_worker_mapping: dict[Role, WorkerType],   # 角色到工作器类的映射
+        resource_pool_manager: ResourcePoolManager,    # 资源池管理器
+        ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,  # Ray 工作器组类
+        processor=None,                               # 可选的数据处理器，用于多模态数据
+        reward_fn=None,                               # 训练期间计算奖励的函数
+        val_reward_fn=None,                           # 验证期间计算奖励的函数
+        train_dataset: Optional[Dataset] = None,      # 训练数据集
+        val_dataset: Optional[Dataset] = None,        # 验证数据集
+        collate_fn=None,                              # 将数据样本整理成批次的函数
+        train_sampler: Optional[Sampler] = None,      # 训练数据集的采样器
+        device_name=None,                             # 训练设备名称（如 "cuda", "cpu"）
     ):
         """
-        Initialize distributed PPO trainer with Ray backend.
-        Note that this trainer runs on the driver process on a single CPU/GPU node.
+        使用 Ray 后端初始化分布式 PPO 训练器。
+        注意：此训练器在单个 CPU/GPU 节点的驱动进程上运行。
 
         Args:
-            config: Configuration object containing training parameters.
-            tokenizer: Tokenizer used for encoding and decoding text.
-            role_worker_mapping (dict[Role, WorkerType]): Mapping from roles to worker classes.
-            resource_pool_manager (ResourcePoolManager): Manager for Ray resource pools.
-            ray_worker_group_cls (RayWorkerGroup, optional): Class for Ray worker groups. Defaults to RayWorkerGroup.
-            processor: Optional data processor, used for multimodal data
-            reward_fn: Function for computing rewards during training.
-            val_reward_fn: Function for computing rewards during validation.
-            train_dataset (Optional[Dataset], optional): Training dataset. Defaults to None.
-            val_dataset (Optional[Dataset], optional): Validation dataset. Defaults to None.
-            collate_fn: Function to collate data samples into batches.
-            train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
-            device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
+            config: 包含训练参数的配置对象。
+            tokenizer: 用于编码和解码文本的分词器。
+            role_worker_mapping (dict[Role, WorkerType]): 从角色到工作器类的映射。
+            resource_pool_manager (ResourcePoolManager): Ray 资源池的管理器。
+            ray_worker_group_cls (RayWorkerGroup, optional): Ray 工作器组的类。默认为 RayWorkerGroup。
+            processor: 可选的数据处理器，用于多模态数据。
+            reward_fn: 训练期间计算奖励的函数。
+            val_reward_fn: 验证期间计算奖励的函数。
+            train_dataset (Optional[Dataset], optional): 训练数据集。默认为 None。
+            val_dataset (Optional[Dataset], optional): 验证数据集。默认为 None。
+            collate_fn: 将数据样本整理成批次的函数。
+            train_sampler (Optional[Sampler], optional): 训练数据集的采样器。默认为 None。
+            device_name (str, optional): 训练设备名称（例如："cuda", "cpu"）。默认为 None。
         """
 
-        # Store the tokenizer for text processing
+        # 存储用于文本处理的分词器
         self.tokenizer = tokenizer
+        # 存储多模态数据处理器
         self.processor = processor
+        # 存储训练配置
         self.config = config
+        # 存储训练奖励函数
         self.reward_fn = reward_fn
+        # 存储验证奖励函数
         self.val_reward_fn = val_reward_fn
 
+        # 检查是否使用混合引擎
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, "Currently, only support hybrid engine"
+        assert self.hybrid_engine, "目前只支持混合引擎"
 
+        # 如果使用混合引擎，确保 ActorRollout 角色存在
         if self.hybrid_engine:
             assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
 
+        # 存储角色到工作器的映射
         self.role_worker_mapping = role_worker_mapping
+        # 存储资源池管理器
         self.resource_pool_manager = resource_pool_manager
+        # 检查是否使用参考策略
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
+        # 检查是否使用奖励模型
         self.use_rm = Role.RewardModel in role_worker_mapping
+        # 存储 Ray 工作器组类
         self.ray_worker_group_cls = ray_worker_group_cls
+        # 设置设备名称
         self.device_name = device_name if device_name else self.config.trainer.device
+        # 初始化验证生成日志记录器
         self.validation_generations_logger = ValidationGenerationsLogger(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
+            project_name=self.config.trainer.project_name,      # 项目名称
+            experiment_name=self.config.trainer.experiment_name, # 实验名称
         )
 
-        # if ref_in_actor is True, the reference policy will be actor without lora applied
+        # 如果 ref_in_actor 为 True，参考策略将是没有应用 LoRA 的 actor
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
 
-        # define in-reward KL control
-        # kl loss control currently not suppoorted
+        # 定义奖励中的 KL 控制
+        # KL 损失控制目前不支持
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
+        # 检查是否使用 critic
         if config.critic.enable is not None:
             self.use_critic = bool(config.critic.enable)
         elif self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+            # 如果使用 GAE 优势估计器，则需要 critic
             self.use_critic = True
         else:
+            # 如果不是 GAE 且未明确启用 critic，发出警告
             warnings.warn(
-                "Disabled critic as algorithm.adv_estimator != gae. "
-                "If it is not intended, please set critic.enable=True",
+                "由于算法优势估计器不是 GAE，已禁用 critic。"
+                "如果这不是预期的，请设置 critic.enable=True",
                 stacklevel=2,
             )
             self.use_critic = False
 
+        # 验证配置并创建数据加载器
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _validate_config(self):
+        """验证训练配置的正确性和一致性。
+        
+        该方法检查各种配置参数的有效性，确保它们相互兼容且满足训练要求。
+        包括 GPU 数量、批次大小、微批次设置等多个方面的验证。
+        """
         config = self.config
-        # number of GPUs total
+        # 计算总 GPU 数量：每节点 GPU 数量 × 节点数
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+        
+        # 如果使用 Megatron 策略，进行特定的配置验证
         if config.actor_rollout_ref.actor.strategy == "megatron":
+            # 计算 Megatron 模型并行大小
             model_parallel_size = (
-                config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size
-                * config.actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
+                config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size     # 张量模型并行大小
+                * config.actor_rollout_ref.actor.megatron.pipeline_model_parallel_size  # 流水线模型并行大小
             )
+            # 验证 GPU 总数能被模型并行大小和上下文并行大小的乘积整除
             assert (
                 n_gpus % (model_parallel_size * config.actor_rollout_ref.actor.megatron.context_parallel_size) == 0
             ), (
-                f"n_gpus ({n_gpus}) must be divisible by model_parallel_size ({model_parallel_size}) times "
-                f"context_parallel_size ({config.actor_rollout_ref.actor.megatron.context_parallel_size})"
+                f"GPU 总数 ({n_gpus}) 必须能被模型并行大小 ({model_parallel_size}) 乘以 "
+                f"上下文并行大小 ({config.actor_rollout_ref.actor.megatron.context_parallel_size}) 整除"
             )
+            # 计算 Megatron 数据并行大小
             megatron_dp = n_gpus // (
                 model_parallel_size * config.actor_rollout_ref.actor.megatron.context_parallel_size
             )
+            # 计算最小的批次大小
             minimal_bsz = megatron_dp * config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
         else:
+            # 非 Megatron 策略下，最小批次大小就是 GPU 总数
             minimal_bsz = n_gpus
 
-        # 1. Check total batch size for data correctness
+        # 1. 检查总批次大小以确保数据正确性
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
         assert real_train_batch_size % minimal_bsz == 0, (
-            f"real_train_batch_size ({real_train_batch_size}) must be divisible by minimal possible batch size "
-            f"({minimal_bsz})"
+            f"实际训练批次大小 ({real_train_batch_size}) 必须能被最小可能批次大小 "
+            f"({minimal_bsz}) 整除"
         )
 
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
@@ -770,14 +898,17 @@ class RayPPOTrainer:
         return metric_dict
 
     def init_workers(self):
-        """Initialize distributed training workers using Ray backend.
+        """使用 Ray 后端初始化分布式训练工作器。
 
-        Creates:
-        1. Ray resource pools from configuration
-        2. Worker groups for each role (actor, critic, etc.)
+        该方法负责创建和初始化所有必要的分布式组件：
+        1. 根据配置创建 Ray 资源池
+        2. 为每个角色（actor、critic 等）创建工作器组
+        3. 初始化异步 rollout 管理器（如果配置了异步模式）
         """
+        # 创建资源池
         self.resource_pool_manager.create_resource_pool()
 
+        # 初始化资源池到类的映射字典
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor and rollout
@@ -875,16 +1006,23 @@ class RayPPOTrainer:
             )
 
     def _save_checkpoint(self):
+        """保存训练检查点。
+        
+        该方法保存当前训练状态到本地和可选的远程存储，
+        包括 actor 模型、critic 模型和数据加载器状态。
+        """
         from verl.utils.fs import local_mkdir_safe
 
-        # path: given_path + `/global_step_{global_steps}` + `/actor`
+        # 构建检查点路径：给定路径 + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(
             self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
         )
 
-        print(f"local_global_step_folder: {local_global_step_folder}")
+        print(f"本地全局步数文件夹: {local_global_step_folder}")
+        # 构建 actor 模型的本地保存路径
         actor_local_path = os.path.join(local_global_step_folder, "actor")
 
+        # 构建 actor 模型的远程保存路径（如果配置了 HDFS）
         actor_remote_path = (
             None
             if self.config.trainer.default_hdfs_dir is None
@@ -1030,43 +1168,48 @@ class RayPPOTrainer:
 
     def fit(self):
         """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC
-        to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
+        PPO 的训练循环主函数。
+        
+        驱动进程只需要通过 RPC 调用工作器组的计算函数来构建 PPO 数据流。
+        轻量级的优势计算在驱动进程上完成。
+        这是整个训练过程的核心入口点。
         """
         from omegaconf import OmegaConf
-
         from verl.utils.tracking import Tracking
 
+        # 初始化日志记录器，用于记录训练过程中的各种指标
         logger = Tracking(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
-            default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
+            project_name=self.config.trainer.project_name,          # 项目名称
+            experiment_name=self.config.trainer.experiment_name,   # 实验名称
+            default_backend=self.config.trainer.logger,           # 默认日志后端
+            config=OmegaConf.to_container(self.config, resolve=True),  # 配置信息
         )
 
+        # 初始化全局步数计数器
         self.global_steps = 0
 
-        # load checkpoint before doing anything
+        # 在进行任何操作之前加载检查点（如果存在）
         self._load_checkpoint()
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
+        # 在训练开始之前执行验证
+        # 目前，我们只支持使用 reward_function 进行验证
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            val_metrics = self._validate()           # 执行验证
+            assert val_metrics, f"{val_metrics=}"   # 确保验证指标不为空
+            pprint(f"初始验证指标: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)  # 记录验证指标
+            # 如果只进行验证，则直接返回
             if self.config.trainer.get("val_only", False):
                 return
 
-        # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        # 添加 tqdm 进度条以可视化训练进度
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="训练进度")
 
-        # we start from step 1
+        # 我们从第 1 步开始
         self.global_steps += 1
+        # 存储最后一次验证指标
         last_val_metrics = None
+        # 记录最大步骤持续时间，用于性能监控
         self.max_steps_duration = 0
 
         prev_step_profile = False
@@ -1077,23 +1220,30 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        # 遍历所有训练轮次
         for epoch in range(self.config.trainer.total_epochs):
+            # 遍历训练数据加载器中的每个批次
             for batch_dict in self.train_dataloader:
+                # 初始化指标字典和时间记录字典
                 metrics = {}
                 timing_raw = {}
 
+                # 使用计时器标记性能分析开始
                 with marked_timer("start_profile", timing_raw):
+                    # 根据配置决定是否开始性能分析
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
                         if self.config.trainer.profile_continuous_steps
                         else curr_step_profile
                     )
 
+                # 将批次字典转换为 DataProto 对象
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                # pop those keys for generation
+                # 移除用于生成的键，准备生成批次
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+                # 根据批次内容动态添加需要移除的键
                 if "multi_modal_data" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("multi_modal_data")
                 if "raw_prompt" in batch.non_tensor_batch:
@@ -1107,46 +1257,64 @@ class RayPPOTrainer:
                 if "agent_name" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("agent_name")
 
+                # 从批次中移除指定的键，创建生成批次
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
 
-                # pass global_steps to trace
+                # 将全局步数传递给生成批次用于追踪
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                # 重复生成批次以进行多次 rollout（通常用于提高样本多样性）
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
+                # 检查是否为最后一步
                 is_last_step = self.global_steps >= self.total_training_steps
 
+                # 使用计时器标记整个训练步骤
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+                    # ========== 生成批次 ==========
                     with marked_timer("gen", timing_raw, color="red"):
+                        # 根据是否使用异步 rollout 模式选择生成方式
                         if not self.async_rollout_mode:
+                            # 同步模式：直接使用工作器组生成序列
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
+                            # 异步模式：使用异步 rollout 管理器生成序列
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        # 更新时间统计信息
                         timing_raw.update(gen_batch_output.meta_info["timing"])
+                        # 移除时间信息以避免数据冗余
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    # ========== REMAX 优势估计的特殊处理 ==========
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        # REMAX 需要奖励函数来计算基线
                         if self.reward_fn is None:
-                            raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+                            raise ValueError("REMAX 优势估计需要奖励函数。")
 
                         with marked_timer("gen_max", timing_raw, color="purple"):
+                            # 创建基线生成批次（不进行采样，使用贪婪解码）
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
+                            # 生成基线序列
                             if not self.async_rollout_mode:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            # 将基线输出合并到主批次
                             batch = batch.union(gen_baseline_output)
+                            # 计算基线奖励
                             reward_baseline_tensor = self.reward_fn(batch)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
+                            # 移除基线批次的键，只保留基线奖励
                             batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
+                            # 存储奖励基线张量
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
+                            # 清理内存
                             del gen_baseline_batch, gen_baseline_output
 
                     batch.non_tensor_batch["uid"] = np.array(
@@ -1169,27 +1337,39 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    # ========== 奖励计算 ==========
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
+                        # 计算奖励模型分数
                         if self.use_rm:
+                            # 如果使用奖励模型，通过工作器组计算分数
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
+                        # 根据配置选择同步或异步奖励计算
                         if self.config.reward_model.launch_reward_fn_async:
+                            # 异步模式：启动远程奖励计算任务
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
+                            # 同步模式：直接计算奖励
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    # recompute old_log_probs
+                    # ========== 重新计算旧的对数概率 ==========
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        # 计算当前策略下的对数概率
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        # 提取熵值和响应掩码
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
+                        # 获取损失聚合模式
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        # 计算熵的聚合值
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                        # 构建熵指标
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
+                        # 移除熵信息以避免数据冗余
                         old_log_prob.batch.pop("entropys")
+                        # 将对数概率信息合并到批次中
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
@@ -1231,54 +1411,66 @@ class RayPPOTrainer:
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
+                    # ========== 优势计算 ==========
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
+                        # 我们结合基于规则的奖励模型
                         reward_extra_infos_dict: dict[str, list]
+                        # 如果使用异步奖励计算，获取异步结果
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        # 将奖励张量存储到批次中
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        # 如果有额外的奖励信息，将其添加到批次中
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # compute rewards. apply_kl_penalty if available
+                        # 计算最终奖励。如果可用，应用 KL 惩罚
                         if self.config.algorithm.use_kl_in_reward:
+                            # 应用 KL 惩罚到奖励中
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
                             metrics.update(kl_metrics)
                         else:
+                            # 不使用 KL 惩罚，直接使用原始奖励
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # compute advantages, executed on the driver process
-
+                        # 计算优势估计，在驱动进程上执行
+                        # 获取 GRPO 优势归一化因子
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
+                        )  # GRPO 优势归一化因子
 
+                        # 调用优势计算函数
                         batch = compute_advantage(
                             batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
+                            adv_estimator=self.config.algorithm.adv_estimator,      # 优势估计器类型
+                            gamma=self.config.algorithm.gamma,                     # 折扣因子
+                            lam=self.config.algorithm.lam,                         # GAE lambda 参数
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,    # 重复次数
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,      # GRPO 归一化设置
+                            config=self.config.algorithm,                         # 算法配置
                         )
 
-                    # update critic
+                    # ========== 更新 Critic ==========
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
+                            # 通过 critic 工作器组更新 critic 网络
                             critic_output = self.critic_wg.update_critic(batch)
+                        # 聚合 critic 输出的指标
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
+                    # ========== 实现 Critic 预热 ==========
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                        # ========== 更新 Actor ==========
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            # 设置多轮对话信息
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            # 通过 actor 工作器组更新 actor 网络
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                        # 聚合 actor 输出的指标
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -1353,37 +1545,44 @@ class RayPPOTrainer:
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
-                # training metrics
+                # ========== 训练指标收集 ==========
                 metrics.update(
                     {
-                        "training/global_step": self.global_steps,
-                        "training/epoch": epoch,
+                        "training/global_step": self.global_steps,  # 全局步数
+                        "training/epoch": epoch,                    # 当前轮次
                     }
                 )
-                # collect metrics
+                # 收集数据相关指标
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # 收集时间相关指标
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
+                # TODO: 实现实际的 TFLOP 和理论 TFLOP 计算
+                # 计算吞吐量指标
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
-                # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+                # 这是实验性功能，未来可能会被更改或删除，以支持通用功能
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+                    # 如果使用课程学习采样器，更新采样器状态
                     self.train_dataloader.sampler.update(batch=batch)
 
-                # TODO: make a canonical logger that supports various backend
+                # TODO: 创建支持各种后端的规范日志记录器
+                # 记录所有指标到日志系统
                 logger.log(data=metrics, step=self.global_steps)
 
+                # 更新进度条
                 progress_bar.update(1)
+                # 增加全局步数
                 self.global_steps += 1
 
+                # 检查是否为最后一步，如果是则结束训练
                 if is_last_step:
-                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    pprint(f"最终验证指标: {last_val_metrics}")
                     progress_bar.close()
                     return
 
-                # this is experimental and may be changed/removed in the future
-                # in favor of a general-purpose data buffer pool
+                # 这是实验性功能，未来可能会被更改或删除
+                # 以支持通用数据缓冲池
                 if hasattr(self.train_dataset, "on_batch_end"):
-                    # The dataset may be changed after each training batch
+                    # 数据集可能在每个训练批次后发生变化
                     self.train_dataset.on_batch_end(batch=batch)
