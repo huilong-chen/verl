@@ -541,118 +541,132 @@ class RayPPOTrainer:
             f"({minimal_bsz}) 整除"
         )
 
-        # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
-        # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
+        # 辅助函数：检查"micro_batch_size"与"micro_batch_size_per_gpu"的互斥性
+        # 如果用户同时设置这两个参数，抛出错误。新的命名规范是"..._micro_batch_size_per_gpu"。
         def check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
-            """Validate mutually exclusive micro batch size configuration options.
+            """验证微批次大小配置选项的互斥性。
 
-            Ensures that users don't set both deprecated micro_batch_size and
-            the new micro_batch_size_per_gpu parameters simultaneously.
+            确保用户不会同时设置已弃用的micro_batch_size参数和
+            新的micro_batch_size_per_gpu参数。
 
             Args:
-                mbs: Deprecated micro batch size parameter value.
-                mbs_per_gpu: New micro batch size per GPU parameter value.
-                name (str): Configuration section name for error messages.
+                mbs: 已弃用的微批次大小参数值。
+                mbs_per_gpu: 新的每GPU微批次大小参数值。
+                name (str): 配置段名称，用于错误消息。
 
             Raises:
-                ValueError: If both parameters are set or neither is set.
+                ValueError: 如果两个参数都设置或都未设置。
             """
+            # 定义不同配置段的参数映射
             settings = {
-                "reward_model": "micro_batch_size",
-                "actor_rollout_ref.ref": "log_prob_micro_batch_size",
-                "actor_rollout_ref.rollout": "log_prob_micro_batch_size",
+                "reward_model": "micro_batch_size",                    # 奖励模型微批次大小
+                "actor_rollout_ref.ref": "log_prob_micro_batch_size",  # 参考策略对数概率微批次大小
+                "actor_rollout_ref.rollout": "log_prob_micro_batch_size", # 推演对数概率微批次大小
             }
 
+            # 检查配置段是否在预定义的设置中
             if name in settings:
-                param = settings[name]
-                param_per_gpu = f"{param}_per_gpu"
+                param = settings[name]              # 获取参数名
+                param_per_gpu = f"{param}_per_gpu"  # 获取每GPU参数名
 
+                # 如果两个参数都未设置，抛出错误
                 if mbs is None and mbs_per_gpu is None:
                     raise ValueError(
-                        f"[{name}] Please set at least one of '{name}.{param}' or '{name}.{param_per_gpu}'."
+                        f"[{name}] 请至少设置 '{name}.{param}' 或 '{name}.{param_per_gpu}' 中的一个。"
                     )
 
+                # 如果两个参数都设置了，抛出错误
                 if mbs is not None and mbs_per_gpu is not None:
                     raise ValueError(
-                        f"[{name}] You have set both '{name}.{param}' AND '{name}.{param_per_gpu}'. Please remove "
-                        f"'{name}.{param}' because only '*_{param_per_gpu}' is supported (the former is deprecated)."
+                        f"[{name}] 您同时设置了 '{name}.{param}' 和 '{name}.{param_per_gpu}'。请移除 "
+                        f"'{name}.{param}'，因为只支持 '*_{param_per_gpu}'（前者已弃用）。"
                     )
 
-        # Actor validation done in ActorConfig.__post_init__ and validate()
+        # Actor配置验证在ActorConfig.__post_init__和validate()中完成
         actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
         actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
 
+        # 如果不使用动态批次大小，进行相关验证
         if not config.actor_rollout_ref.actor.use_dynamic_bsz:
             if self.use_reference_policy:
-                # reference: log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu
+                # 参考策略：检查log_prob_micro_batch_size与log_prob_micro_batch_size_per_gpu的互斥性
                 check_mutually_exclusive(
                     config.actor_rollout_ref.ref.log_prob_micro_batch_size,
                     config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu,
                     "actor_rollout_ref.ref",
                 )
 
-            #  The rollout section also has log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu
+            # 推演段也有log_prob_micro_batch_size与log_prob_micro_batch_size_per_gpu的互斥性检查
             check_mutually_exclusive(
                 config.actor_rollout_ref.rollout.log_prob_micro_batch_size,
                 config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
                 "actor_rollout_ref.rollout",
             )
 
-        # Check for reward model micro-batch size conflicts
+        # 检查奖励模型微批次大小冲突
         if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
             check_mutually_exclusive(
                 config.reward_model.micro_batch_size, config.reward_model.micro_batch_size_per_gpu, "reward_model"
             )
 
+        # 检查是否同时启用了奖励中的KL散度和KL损失
         if self.config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
-            print("NOTICE: You have both enabled in-reward kl and kl loss.")
+            print("注意：您同时启用了奖励中的KL散度和KL损失。")
 
-        # critic
+        # 评论家配置验证
         if self.use_critic:
             critic_config = omega_conf_to_dataclass(config.critic)
             critic_config.validate(n_gpus, config.data.train_batch_size)
 
+        # 检查验证批次大小配置（已弃用）
         if config.data.get("val_batch_size", None) is not None:
             print(
-                "WARNING: val_batch_size is deprecated."
-                + " Validation datasets are sent to inference engines as a whole batch,"
-                + " which will schedule the memory themselves."
+                "警告：val_batch_size已弃用。"
+                + "验证数据集作为整体批次发送到推理引擎，"
+                + "推理引擎会自行调度内存。"
             )
 
-        # check eval config
+        # 检查评估配置
         if config.actor_rollout_ref.rollout.val_kwargs.do_sample:
             assert config.actor_rollout_ref.rollout.temperature > 0, (
-                "validation gen temperature should be greater than 0 when enabling do_sample"
+                "启用do_sample时，验证生成的温度必须大于0"
             )
 
-        print("[validate_config] All configuration checks passed successfully!")
+        print("[validate_config] 所有配置检查都成功通过！")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
-        Creates the train and validation dataloaders.
+        创建训练和验证数据加载器。
         """
-        # TODO: we have to make sure the batch size is divisible by the dp size
+        # TODO：我们必须确保批次大小能被数据并行大小整除
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
+        # 如果未提供训练数据集，则创建训练数据集
         if train_dataset is None:
             train_dataset = create_rl_dataset(
                 self.config.data.train_files, self.config.data, self.tokenizer, self.processor
             )
+        # 如果未提供验证数据集，则创建验证数据集
         if val_dataset is None:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files, self.config.data, self.tokenizer, self.processor
             )
+        # 保存训练和验证数据集
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
+        # 如果未提供训练采样器，则创建训练采样器
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+        # 如果未提供整理函数，则使用默认的整理函数
         if collate_fn is None:
             from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
             collate_fn = default_collate_fn
 
+        # 获取数据加载器的工作进程数
         num_workers = self.config.data["dataloader_num_workers"]
 
+        # 创建训练数据加载器
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
@@ -662,10 +676,12 @@ class RayPPOTrainer:
             sampler=train_sampler,
         )
 
-        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
+        # 获取验证批次大小，优先使用配置中的值
+        val_batch_size = self.config.data.val_batch_size
         if val_batch_size is None:
             val_batch_size = len(self.val_dataset)
 
+        # 创建验证数据加载器
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             batch_size=val_batch_size,
@@ -675,113 +691,137 @@ class RayPPOTrainer:
             collate_fn=collate_fn,
         )
 
-        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
-        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        # 确保数据加载器不为空
+        assert len(self.train_dataloader) >= 1, "训练数据加载器为空！"
+        assert len(self.val_dataloader) >= 1, "验证数据加载器为空！"
 
+        # 打印数据加载器大小信息
         print(
-            f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
+            f"训练数据加载器大小: {len(self.train_dataloader)}, 验证数据加载器大小: "
             f"{len(self.val_dataloader)}"
         )
 
+        # 计算总训练步数
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
+        # 如果配置中指定了总训练步数，则使用配置值
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
 
+        # 保存总训练步数
         self.total_training_steps = total_training_steps
-        print(f"Total training steps: {self.total_training_steps}")
+        print(f"总训练步数: {self.total_training_steps}")
 
+        # 尝试在配置中设置总训练步数
         try:
             OmegaConf.set_struct(self.config, True)
             with open_dict(self.config):
+                # 为actor优化器设置总训练步数
                 if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
                     self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+                # 为critic优化器设置总训练步数
                 if OmegaConf.select(self.config, "critic.optim"):
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
-            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+            print(f"警告：无法在配置中设置total_training_steps。结构缺失？错误：{e}")
 
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+        """将推演/验证样本转储为JSONL格式。"""
+        # 创建转储目录（如果不存在）
         os.makedirs(dump_path, exist_ok=True)
+        # 生成文件名，包含当前全局步数
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
+        # 获取样本数量
         n = len(inputs)
+        # 构建基础数据字典
         base_data = {
-            "input": inputs,
-            "output": outputs,
-            "score": scores,
-            "step": [self.global_steps] * n,
+            "input": inputs,                           # 输入文本
+            "output": outputs,                         # 输出文本
+            "score": scores,                           # 得分
+            "step": [self.global_steps] * n,           # 全局步数
         }
 
+        # 将奖励额外信息添加到基础数据中
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
 
+        # 构建JSON行
         lines = []
         for i in range(n):
+            # 为每个样本创建条目
             entry = {k: v[i] for k, v in base_data.items()}
+            # 转换为JSON字符串（确保支持非ASCII字符）
             lines.append(json.dumps(entry, ensure_ascii=False))
 
+        # 将JSON行写入文件
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
 
-        print(f"Dumped generations to {filename}")
+        print(f"已将生成结果转储到 {filename}")
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
-        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
+        """将验证样本表格记录到配置的日志器中（wandb或swanlab）"""
 
+        # 获取要记录的生成样本数量
         generations_to_log = self.config.trainer.log_val_generations
 
+        # 如果配置为0，则不记录
         if generations_to_log == 0:
             return
 
         import numpy as np
 
-        # Create tuples of (input, output, score) and sort by input text
+        # 创建(输入, 输出, 得分)元组并按输入文本排序
         samples = list(zip(inputs, outputs, scores, strict=True))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
+        samples.sort(key=lambda x: x[0])  # 按输入文本排序
 
-        # Use fixed random seed for deterministic shuffling
+        # 使用固定随机种子进行确定性洗牌
         rng = np.random.RandomState(42)
         rng.shuffle(samples)
 
-        # Take first N samples after shuffling
+        # 洗牌后取前N个样本
         samples = samples[:generations_to_log]
 
-        # Log to each configured logger
+        # 记录到每个配置的日志器
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _validate(self):
+        # 初始化数据源列表和奖励额外信息字典
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
-        # Lists to collect samples for the table
-        sample_inputs = []
-        sample_outputs = []
-        sample_scores = []
-        sample_turns = []
+        # 用于收集表格样本的列表
+        sample_inputs = []      # 输入样本
+        sample_outputs = []     # 输出样本
+        sample_scores = []      # 得分样本
+        sample_turns = []       # 轮次样本
 
+        # 遍历验证数据加载器中的每个测试数据
         for test_data in self.val_dataloader:
+            # 从单个字典创建数据原型
             test_batch = DataProto.from_single_dict(test_data)
 
-            # repeat test batch
+            # 重复测试批次
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            # we only do validation on rule-based rm
+            # 我们只对基于规则的奖励模型进行验证
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
-            # Store original inputs
+            # 存储原始输入
             input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
+            # TODO：我们可以保留除填充标记外的特殊标记吗？
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
 
+            # 定义需要从批次中移除的键
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+            # 根据批次内容动态添加需要移除的非张量键
             if "multi_modal_data" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("multi_modal_data")
             if "raw_prompt" in test_batch.non_tensor_batch:
@@ -792,70 +832,80 @@ class RayPPOTrainer:
                 non_tensor_batch_keys_to_pop.append("interaction_kwargs")
             if "agent_name" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("agent_name")
+            # 移除指定的键，创建生成批次
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
 
+            # 设置生成批次的元信息
             test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
+                "eos_token_id": self.tokenizer.eos_token_id,        # 结束标记ID
+                "pad_token_id": self.tokenizer.pad_token_id,        # 填充标记ID
+                "recompute_log_prob": False,                       # 不重新计算对数概率
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,  # 是否采样
+                "validate": True,                                   # 验证模式
+                "global_steps": self.global_steps,                  # 全局步数
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # pad to be divisible by dp_size
+            # 填充使批次大小能被数据并行大小整除
             size_divisor = (
-                self.actor_rollout_wg.world_size
+                self.actor_rollout_wg.world_size                    # 非异步模式：使用工作器组大小
                 if not self.async_rollout_mode
-                else self.config.actor_rollout_ref.rollout.agent.num_workers
+                else self.config.actor_rollout_ref.rollout.agent.num_workers  # 异步模式：使用代理工作器数
             )
+            # 填充数据原型
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             if not self.async_rollout_mode:
+                # 非异步模式：使用工作器组生成序列
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
+                # 异步模式：使用异步推演管理器生成序列
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            # unpad
+            # 去除填充
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
-            print("validation generation end")
+            print("验证生成结束")
 
-            # Store generated outputs
+            # 存储生成的输出
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
+            # 合并原始批次和生成批次
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
-            # evaluate using reward_function
+            # 使用奖励函数进行评估
             if self.val_reward_fn is None:
-                raise ValueError("val_reward_fn must be provided for validation.")
+                raise ValueError("验证时必须提供val_reward_fn。")
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
+            # 将得分添加到奖励额外信息字典
             reward_extra_infos_dict["reward"].extend(scores)
-            print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
+            print(f"reward_extra_infos_dict['reward']长度: {len(reward_extra_infos_dict['reward'])}")
+            # 如果有额外的奖励信息，也添加到字典中
             if "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
-                    print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
+                    print(f"reward_extra_infos_dict['{key}']长度: {len(reward_extra_infos_dict[key])}")
 
-            # collect num_turns of each prompt
+            # 收集每个提示的轮次数
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
+            # 收集数据源信息
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
+        # 记录验证生成结果
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        # dump generations
+        # 转储生成结果
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
             self._dump_generations(
@@ -866,34 +916,43 @@ class RayPPOTrainer:
                 dump_path=val_data_dir,
             )
 
+        # 验证奖励额外信息字典的长度一致性
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
+        # 合并所有数据源
         data_sources = np.concatenate(data_source_lst, axis=0)
 
+        # 处理验证指标
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
         metric_dict = {}
+        # 遍历每个数据源的指标
         for data_source, var2metric2val in data_src2var2metric2val.items():
+            # 确定核心变量（优先使用准确率，否则使用奖励）
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
+                # 找到最大n值
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
+                    # 判断是否为核心指标
                     if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
+                        (var_name == core_var)                              # 是核心变量
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])  # 是主要指标
+                        and (f"@{n_max}" in metric_name)                    # 是最大n值
                     ):
-                        metric_sec = "val-core"
+                        metric_sec = "val-core"  # 核心验证指标
                     else:
-                        metric_sec = "val-aux"
+                        metric_sec = "val-aux"   # 辅助验证指标
+                    # 构建指标前缀
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
+        # 如果有轮次数据，计算轮次统计信息
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
-            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
-            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
-            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+            metric_dict["val-aux/num_turns/min"] = sample_turns.min()    # 最小轮次
+            metric_dict["val-aux/num_turns/max"] = sample_turns.max()    # 最大轮次
+            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()  # 平均轮次
 
         return metric_dict
 
@@ -905,104 +964,142 @@ class RayPPOTrainer:
         2. 为每个角色（actor、critic 等）创建工作器组
         3. 初始化异步 rollout 管理器（如果配置了异步模式）
         """
-        # 创建资源池
+        # 创建资源池：根据配置分配和管理计算资源
         self.resource_pool_manager.create_resource_pool()
 
-        # 初始化资源池到类的映射字典
+        # 初始化资源池到类的映射字典：为每个资源池创建空字典
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
-        # create actor and rollout
+        # 创建 actor 和 rollout 工作器
         if self.hybrid_engine:
+            # 获取 actor 和 rollout 角色的资源池
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            # 创建带有初始化参数的 Ray 类
             actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
-                role="actor_rollout",
-                profile_option=self.config.trainer.npu_profile.options,
+                cls=self.role_worker_mapping[Role.ActorRollout],     # 工作器类
+                config=self.config.actor_rollout_ref,               # 配置参数
+                role="actor_rollout",                               # 角色标识
+                profile_option=self.config.trainer.npu_profile.options,  # 性能分析选项
             )
+            # 将 actor_rollout 类添加到对应资源池的映射中
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
+            # 如果不是混合引擎模式，抛出未实现错误
             raise NotImplementedError
 
-        # create critic
+        # 创建评论家工作器（如果启用）
         if self.use_critic:
+            # 获取评论家角色的资源池
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+            # 将评论家配置转换为数据类
             critic_cfg = omega_conf_to_dataclass(self.config.critic)
+            # 创建带有初始化参数的评论家 Ray 类
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
+            # 将评论家类添加到对应资源池的映射中
             self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
 
-        # create reference policy if needed
+        # 如果需要，创建参考策略工作器
         if self.use_reference_policy:
+            # 获取参考策略角色的资源池
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            # 创建带有初始化参数的参考策略 Ray 类
             ref_policy_cls = RayClassWithInitArgs(
-                self.role_worker_mapping[Role.RefPolicy],
-                config=self.config.actor_rollout_ref,
-                role="ref",
-                profile_option=self.config.trainer.npu_profile.options,
+                self.role_worker_mapping[Role.RefPolicy],            # 参考策略工作器类
+                config=self.config.actor_rollout_ref,                # 配置参数
+                role="ref",                                          # 角色标识
+                profile_option=self.config.trainer.npu_profile.options,  # 性能分析选项
             )
+            # 将参考策略类添加到对应资源池的映射中
             self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
 
-        # create a reward model if reward_fn is None
+        # 如果奖励函数为空，则创建奖励模型
         if self.use_rm:
-            # we create a RM here
+            # 在这里创建奖励模型
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            # 创建带有初始化参数的奖励模型 Ray 类
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+            # 将奖励模型类添加到对应资源池的映射中
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
 
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`.
-        # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
-        all_wg = {}
-        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        # 初始化工作器组
+        # 注意：如果想为每个角色使用不同的资源池以支持不同的并行大小，
+        # 不应该使用 `create_colocated_worker_cls`。
+        # 相反，应该直接将不同的资源池传递给不同的工作器组。
+        # 更多信息请参考：https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb
+        all_wg = {}           # 存储所有工作器组的字典
+        wg_kwargs = {}         # 设置 RayWorkerGroup 的参数
+        # 检查是否配置了 Ray 等待注册中心超时时间
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        # 检查是否配置了性能分析步数
         if OmegaConf.select(self.config.trainer, "profile_steps") is not None:
             wg_kwargs["profile_steps"] = OmegaConf.select(self.config.trainer, "profile_steps")
+            # 确保在设置 profile_steps 时也设置了 worker_nsight_options
             assert OmegaConf.select(self.config.trainer, "worker_nsight_options") is not None, (
-                "worker_nsight_options must be set when profile_steps is set"
+                "设置 profile_steps 时必须设置 worker_nsight_options"
             )
+            # 将 Nsight 性能分析选项转换为字典格式
             wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
                 OmegaConf.select(self.config.trainer, "worker_nsight_options")
             )
+        # 设置设备名称
         wg_kwargs["device_name"] = self.device_name
 
+        # 遍历每个资源池和对应的类字典
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            # 创建共置工作器类：将多个角色的工作器放在同一资源池中
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            # 创建工作器组字典
             wg_dict = self.ray_worker_group_cls(
-                resource_pool=resource_pool,
-                ray_cls_with_init=worker_dict_cls,
-                **wg_kwargs,
+                resource_pool=resource_pool,           # 资源池
+                ray_cls_with_init=worker_dict_cls,     # 带初始化参数的 Ray 类
+                **wg_kwargs,                           # 工作器组参数
             )
+            # 生成工作器组：根据类字典的前缀生成多个工作器组
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            # 将生成的工作器组添加到总工作器组字典中
             all_wg.update(spawn_wg)
 
+        # 初始化评论家工作器组（如果启用）
         if self.use_critic:
+            # 从工作器组字典中获取评论家工作器组
             self.critic_wg = all_wg["critic"]
+            # 初始化评论家模型
             self.critic_wg.init_model()
 
+        # 初始化参考策略工作器组（如果需要且不在 actor 中）
         if self.use_reference_policy and not self.ref_in_actor:
+            # 从工作器组字典中获取参考策略工作器组
             self.ref_policy_wg = all_wg["ref"]
+            # 初始化参考策略模型
             self.ref_policy_wg.init_model()
 
+        # 初始化奖励模型工作器组（如果启用）
         if self.use_rm:
+            # 从工作器组字典中获取奖励模型工作器组
             self.rm_wg = all_wg["rm"]
+            # 初始化奖励模型
             self.rm_wg.init_model()
 
-        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+        # 我们应该在最后创建 rollout，这样 vllm 可以更好地估计 kv 缓存内存
+        # 从工作器组字典中获取 actor 和 rollout 工作器组
         self.actor_rollout_wg = all_wg["actor_rollout"]
+        # 初始化 actor 和 rollout 模型
         self.actor_rollout_wg.init_model()
 
-        # create async rollout manager and request scheduler
-        self.async_rollout_mode = False
+        # 创建异步 rollout 管理器和请求调度器
+        self.async_rollout_mode = False   # 默认为同步模式
+        # 检查是否配置为异步模式
         if self.config.actor_rollout_ref.rollout.mode == "async":
+            # 导入 AgentLoopManager
             from verl.experimental.agent_loop import AgentLoopManager
 
+            # 设置为异步模式
             self.async_rollout_mode = True
+            # 创建异步 rollout 管理器
             self.async_rollout_manager = AgentLoopManager(
-                config=self.config,
-                worker_group=self.actor_rollout_wg,
+                config=self.config,                    # 训练配置
+                worker_group=self.actor_rollout_wg,    # 工作器组
             )
 
     def _save_checkpoint(self):
@@ -1071,60 +1168,88 @@ class RayPPOTrainer:
             f.write(str(self.global_steps))
 
     def _load_checkpoint(self):
+        """加载训练检查点以恢复训练状态。
+        
+        该函数根据配置的恢复模式，从本地文件系统加载模型检查点，
+        包括Actor和Critic模型参数，以及数据加载器状态。
+        
+        Returns:
+            int: 恢复的全局步数，如果没有检查点则返回0。
+        """
+        # 检查是否禁用了检查点恢复功能
         if self.config.trainer.resume_mode == "disable":
             return 0
 
-        # load from hdfs
+        # 从HDFS加载检查点（当前未实现）
         if self.config.trainer.default_hdfs_dir is not None:
             raise NotImplementedError("load from hdfs is not implemented yet")
         else:
+            # 获取本地检查点文件夹路径
             checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
+            # 如果路径不是绝对路径，则将其转换为绝对路径
             if not os.path.isabs(checkpoint_folder):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+            # 查找最新的检查点路径，如果没有找到则返回None
             global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
 
-        # find global_step_folder
+        # 根据恢复模式确定要加载的检查点文件夹
         if self.config.trainer.resume_mode == "auto":
+            # 自动模式：如果没有找到检查点，则从头开始训练
             if global_step_folder is None:
                 print("Training from scratch")
                 return 0
         else:
+            # 指定路径模式：从配置的路径恢复训练
             if self.config.trainer.resume_mode == "resume_path":
+                # 验证恢复路径参数
                 assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
                 assert "global_step_" in self.config.trainer.resume_from_path, (
                     "resume ckpt must specify the global_steps"
                 )
+                # 使用指定的恢复路径
                 global_step_folder = self.config.trainer.resume_from_path
+                # 如果路径不是绝对路径，则将其转换为绝对路径
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
+        
+        # 打印加载的检查点文件夹信息
         print(f"Load from checkpoint folder: {global_step_folder}")
-        # set global step
+        
+        # 从文件夹路径中提取并设置全局步数
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
 
+        # 打印恢复训练的详细信息
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
 
+        # 构建Actor和Critic模型的检查点路径
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
-        # load actor
+        
+        # 加载Actor模型检查点
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
-        # load critic
+        
+        # 如果使用Critic，则加载Critic模型检查点
         if self.use_critic:
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
 
-        # load dataloader,
-        # TODO: from remote not implemented yet
+        # 加载数据加载器状态
+        # TODO: 从远程加载尚未实现
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+        # 检查数据加载器状态文件是否存在
         if os.path.exists(dataloader_local_path):
+            # 加载数据加载器状态字典
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+            # 恢复数据加载器的状态
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
+            # 如果没有找到数据加载器状态文件，发出警告并从头开始
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _start_profiling(self, do_profile: bool) -> None:

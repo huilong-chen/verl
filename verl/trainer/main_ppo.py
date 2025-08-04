@@ -161,8 +161,8 @@ class TaskRunner:
             use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
             if use_legacy_worker_impl in ["auto", "enable"]:
                 # import warnings
-                # warnings.warn(f"Legacy worker impl is going to be deprecated, will be removed in the future. \
-                #   Please set trainer.use_legacy_worker_impl = false to switch to the new worker implementation.")
+                # warnings.warn(f"传统工作器实现即将被弃用，未来将被移除。\\n"
+                #               f"请设置 trainer.use_legacy_worker_impl = false 以切换到新的工作器实现。")
                 # 导入传统CriticWorker
                 from verl.workers.fsdp_workers import CriticWorker
             elif use_legacy_worker_impl == "disable":
